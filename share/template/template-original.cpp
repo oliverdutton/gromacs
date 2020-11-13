@@ -1,7 +1,8 @@
 /*
  * This file is part of the GROMACS molecular simulation package.
  *
- * Copyright (c) 2011,2012,2013,2014,2015,2019, by the GROMACS development team, led by
+ * Copyright (c) 2011,2012,2013,2014,2015 by the GROMACS development team.
+ * Copyright (c) 2019,2020, by the GROMACS development team, led by
  * Mark Abraham, David van der Spoel, Berk Hess, and Erik Lindahl,
  * and including many others, as listed in the AUTHORS file in the
  * top-level source directory and at http://www.gromacs.org.
@@ -34,32 +35,10 @@
  */
 #include <string>
 #include <vector>
-#include <iostream>
-#include <unistd.h>
-#include <cstring>
-using namespace std;
 
 #include <gromacs/trajectoryanalysis.h>
+
 using namespace gmx;
-
-void executeCommand(string command, FILE* outfile=stdout) {
-    FILE* fp;
-    char path[PATH_MAX];
-    int status;
-
-    fp = popen(command.c_str(), "r");
-    if (fp == NULL) {
-        fprintf(outfile, "Error, pipe from popen returned null pointer");
-    }
-    while (fgets(path, PATH_MAX, fp) != NULL)
-        fprintf(outfile, "%s", path);
-    status = pclose(fp);
-    if (status == -1) {
-        printf("Error, child status from popen could not be obtained");
-    }
-}
-
-
 
 /*! \brief
  * Template class to serve as a basis for user analysis tools.
@@ -82,15 +61,23 @@ class AnalysisTemplate : public TrajectoryAnalysisModule
 
     private:
         class ModuleData;
-        std::string                      custom_output_, groups_string_;
-        // Selection                       refsel_;
-        // SelectionList                   sel_;
+
+        std::string                      fnDist_;
+        double                           cutoff_;
+        Selection                        refsel_;
+        SelectionList                    sel_;
+
+        AnalysisNeighborhood             nb_;
+
+        AnalysisData                     data_;
+        AnalysisDataAverageModulePointer avem_;
 };
 
 
 AnalysisTemplate::AnalysisTemplate()
+    : cutoff_(0.0)
 {
-    // registerAnalysisDataset(&data_, "avedist");
+    registerAnalysisDataset(&data_, "avedist");
 }
 
 
@@ -99,8 +86,8 @@ AnalysisTemplate::initOptions(IOptionsContainer          *options,
                               TrajectoryAnalysisSettings *settings)
 {
     static const char *const desc[] = {
-        "Template which calls voro_interfaces++, an external program,",
-        "to calculate voronoi interface area between groups",
+        "This is a template for writing your own analysis tools for",
+        "GROMACS. The advantage of using GROMACS for this is that you",
         "have access to all information in the topology, and your",
         "program will be able to handle all types of coordinates and",
         "trajectory files supported by GROMACS. In addition,",
@@ -115,39 +102,47 @@ AnalysisTemplate::initOptions(IOptionsContainer          *options,
     };
 
     settings->setHelpText(desc);
-    options->addOption(StringOption("c")
-                              .store(&custom_output_)
-                              .description("NOT IMPLEMENTED, Specify a custom output string"));
-    options->addOption(StringOption("groups")
-                              .store(&groups_string_)
-                              .required()
-                              .description(
-        "Groups should be given as upper limit atomic id's specified in "
-        "monotonically increasing order and hence must be contiguous in id number "
-        "eg if you had  group1 from atom id's 1 to 100, group2 101 to 123, "
-        "group3 124 to end you would give the string \"100 123\" (with explict quotation marks) "
-        "Note: in GROMACS id's are 1-indexed, not 0-indexed "));
-    // options->addOption(FileNameOption("o")
-    //                        .filetype(eftPlot).outputFile()
-    //                        .store(&fnDist_).defaultBasename("avedist")
-    //                        .description("Average distances from reference group"));
-    // options->addOption(SelectionOption("reference")
-    //                        .store(&refsel_).required()
-    //                        .description("Reference group to calculate distances from"));
-    // options->addOption(SelectionOption("select")
-    //                        .storeVector(&sel_).required().multiValue()
-    //                        .description("Groups to calculate distances to"));
 
-    // settings->setFlag(TrajectoryAnalysisSettings::efRequireTop);
+    options->addOption(FileNameOption("o")
+                           .filetype(eftPlot).outputFile()
+                           .store(&fnDist_).defaultBasename("avedist")
+                           .description("Average distances from reference group"));
+
+    options->addOption(SelectionOption("reference")
+                           .store(&refsel_).required()
+                           .description("Reference group to calculate distances from"));
+    options->addOption(SelectionOption("select")
+                           .storeVector(&sel_).required().multiValue()
+                           .description("Groups to calculate distances to"));
+
+    options->addOption(DoubleOption("cutoff").store(&cutoff_)
+                           .description("Cutoff for distance calculation (0 = no cutoff)"));
+
+    settings->setFlag(TrajectoryAnalysisSettings::efRequireTop);
 }
 
 
 void
 AnalysisTemplate::initAnalysis(const TrajectoryAnalysisSettings &settings,
-                               const TopologyInformation         &top)
+                               const TopologyInformation         & /*top*/)
 {
-    // Examples for accessing topology
-    // top.atoms()[0].atom[0].m;
+    nb_.setCutoff(static_cast<real>(cutoff_));
+
+    data_.setColumnCount(0, sel_.size());
+
+    avem_.reset(new AnalysisDataAverageModule());
+    data_.addModule(avem_);
+
+    if (!fnDist_.empty())
+    {
+        AnalysisDataPlotModulePointer plotm(
+                new AnalysisDataPlotModule(settings.plotSettings()));
+        plotm->setFileName(fnDist_);
+        plotm->setTitle("Average distance");
+        plotm->setXAxisIsTime();
+        plotm->setYLabel("Distance (nm)");
+        data_.addModule(plotm);
+    }
 }
 
 
@@ -155,48 +150,43 @@ void
 AnalysisTemplate::analyzeFrame(int frnr, const t_trxframe &fr, t_pbc *pbc,
                                TrajectoryAnalysisModuleData *pdata)
 {
-    string coords, command, pre_command;
-    int dimension_scaling = 10; // x10 multipliers are needed as gromacs coords are in nm^2 while we output Angstrom^2
-    /* voro++ requires a file format of
-    atom_id x y z
-    .gro files, from which the cutoff id's are chosen are indexed from 1
-    and so we index here similarly
-    */
+    AnalysisDataHandle         dh     = pdata->dataHandle(data_);
+    const Selection           &refsel = pdata->parallelSelection(refsel_);
 
-    for (int i=0; i<fr.natoms; i++) {
-        // i index loops atoms
-        coords += to_string(i+1); 
-        coords += " ";
-        for (int j=0; j<3; j++) {
-            // j index is for x, y and z
-            coords += to_string(fr.x[i][j] * dimension_scaling);
-            coords += " ";
+    AnalysisNeighborhoodSearch nbsearch = nb_.initSearch(pbc, refsel);
+    dh.startFrame(frnr, fr.time);
+    for (size_t g = 0; g < sel_.size(); ++g)
+    {
+        const Selection &sel   = pdata->parallelSelection(sel_[g]);
+        int              nr    = sel.posCount();
+        real             frave = 0.0;
+        for (int i = 0; i < nr; ++i)
+        {
+            SelectionPosition p = sel.position(i);
+            frave += nbsearch.minimumDistance(p.x());
         }
-        coords += "\n";
+        frave /= nr;
+        dh.setPoint(g, frave);
     }
-
-    float box_len = fr.box[0][0] * dimension_scaling; // Assume box is cubic
-    pre_command = "voro_interfaces++ -stdin -stdout -sum -gp " + groups_string_ + " -p 0 " + to_string(box_len) + " 0 " + to_string(box_len) + " 0 " + to_string(box_len) + " file_name_placeholder <<< \"";
-    command = pre_command + coords + "\"";   
-
-    // Command check
-    cout << "\n" << pre_command << "\n";
-    // executeCommand(command);
-
-}   
+    dh.finishFrame();
+}
 
 
 void
 AnalysisTemplate::finishAnalysis(int /*nframes*/)
 {
-    // Things to do after having analysed all frames
 }
 
 
 void
 AnalysisTemplate::writeOutput()
 {
-    // Can output things...
+    // We print out the average of the mean distances for each group.
+    for (size_t g = 0; g < sel_.size(); ++g)
+    {
+        fprintf(stderr, "Average mean distance for '%s': %.3f nm\n",
+                sel_[g].name(), avem_->average(0, g));
+    }
 }
 
 /*! \brief
